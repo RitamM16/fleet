@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 
@@ -11,6 +12,8 @@ import (
 	"github.com/go-playground/webhooks/v6/gitlab"
 	"github.com/go-playground/webhooks/v6/gogs"
 	corev1 "k8s.io/api/core/v1"
+
+	gerrit "github.com/rancher/fleet/pkg/webhook/gerrit"
 )
 
 const (
@@ -23,9 +26,9 @@ const (
 	azurePassword      = "azure-password"
 )
 
-func parseWebhook(r *http.Request, secret *corev1.Secret) (interface{}, error) {
+func parseWebhook(r *http.Request, secret *corev1.Secret) (any, error) {
 	switch {
-	//Gogs needs to be checked before Github since it carries both Gogs and (incompatible) Github headers
+	// Gogs needs to be checked before Github since it carries both Gogs and (incompatible) Github headers
 	case r.Header.Get("X-Gogs-Event") != "":
 		return parseGogs(r, secret)
 	case r.Header.Get("X-GitHub-Event") != "":
@@ -38,6 +41,9 @@ func parseWebhook(r *http.Request, secret *corev1.Secret) (interface{}, error) {
 		return parseBitbucketServer(r, secret)
 	case r.Header.Get("X-Vss-Activityid") != "" || r.Header.Get("X-Vss-Subscriptionid") != "":
 		return parseAzureDevops(r, secret)
+	// Gerrit does not provide any discernible headers to identify the event. So we need to put it at the end.
+	case r.Header.Get("x-origin-url") != "":
+		return parseGerrit(r, secret)
 	}
 
 	return nil, nil
@@ -45,7 +51,7 @@ func parseWebhook(r *http.Request, secret *corev1.Secret) (interface{}, error) {
 
 func getValue(secret *corev1.Secret, key string) (string, error) {
 	if secret == nil {
-		return "", fmt.Errorf("secret is nil")
+		return "", errors.New("secret is nil")
 	}
 
 	value, ok := secret.Data[key]
@@ -56,7 +62,7 @@ func getValue(secret *corev1.Secret, key string) (string, error) {
 	return string(value), nil
 }
 
-func parseGogs(r *http.Request, secret *corev1.Secret) (interface{}, error) {
+func parseGogs(r *http.Request, secret *corev1.Secret) (any, error) {
 	var hook *gogs.Webhook
 	var err error
 
@@ -78,7 +84,24 @@ func parseGogs(r *http.Request, secret *corev1.Secret) (interface{}, error) {
 	return hook.Parse(r, gogs.PushEvent)
 }
 
-func parseGithub(r *http.Request, secret *corev1.Secret) (interface{}, error) {
+func parseGerrit(r *http.Request, secret *corev1.Secret) (any, error) {
+	var hook *gerrit.Webhook
+	var err error
+
+	if secret != nil {
+		// Gerrit does not support secrets.
+	}
+
+	hook, err = gerrit.New()
+
+	if err != nil {
+		return nil, err
+	}
+
+	return hook.Parse(r, gerrit.ChangeMergedEvent)
+}
+
+func parseGithub(r *http.Request, secret *corev1.Secret) (any, error) {
 	var hook *github.Webhook
 	var err error
 
@@ -102,7 +125,7 @@ func parseGithub(r *http.Request, secret *corev1.Secret) (interface{}, error) {
 	return hook.Parse(r, github.PushEvent)
 }
 
-func parseGitlab(r *http.Request, secret *corev1.Secret) (interface{}, error) {
+func parseGitlab(r *http.Request, secret *corev1.Secret) (any, error) {
 	var hook *gitlab.Webhook
 	var err error
 
@@ -124,7 +147,7 @@ func parseGitlab(r *http.Request, secret *corev1.Secret) (interface{}, error) {
 	return hook.Parse(r, gitlab.PushEvents, gitlab.TagEvents)
 }
 
-func parseBitbucket(r *http.Request, secret *corev1.Secret) (interface{}, error) {
+func parseBitbucket(r *http.Request, secret *corev1.Secret) (any, error) {
 	var hook *bitbucket.Webhook
 	var err error
 
@@ -146,7 +169,7 @@ func parseBitbucket(r *http.Request, secret *corev1.Secret) (interface{}, error)
 	return hook.Parse(r, bitbucket.RepoPushEvent)
 }
 
-func parseBitbucketServer(r *http.Request, secret *corev1.Secret) (interface{}, error) {
+func parseBitbucketServer(r *http.Request, secret *corev1.Secret) (any, error) {
 	var hook *bitbucketserver.Webhook
 	var err error
 
@@ -168,7 +191,7 @@ func parseBitbucketServer(r *http.Request, secret *corev1.Secret) (interface{}, 
 	return hook.Parse(r, bitbucketserver.RepositoryReferenceChangedEvent)
 }
 
-func parseAzureDevops(r *http.Request, secret *corev1.Secret) (interface{}, error) {
+func parseAzureDevops(r *http.Request, secret *corev1.Secret) (any, error) {
 	var hook *azuredevops.Webhook
 	var err error
 

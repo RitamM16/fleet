@@ -2,10 +2,12 @@ package utils
 
 import (
 	"context"
+	"os"
 	"strings"
 
 	"github.com/rancher/fleet/pkg/apis/fleet.cattle.io/v1alpha1"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
@@ -64,6 +66,27 @@ func CreateCluster(ctx context.Context, k8sClient client.Client, name, controlle
 		c.Status.Namespace = clusterNs
 		return k8sClient.Status().Update(ctx, c)
 	})
+	// Annotate the cluster namespace so bundledeployment events can map back to the cluster.
+	// These annotations are normally added by agent-management controllers during cluster registration.
+	// In envtest, we must add them manually so the ClusterReconciler's mapBundleDeploymentToCluster()
+	// handler can route bundledeployment events to trigger cluster reconciliation.
+	// Without these annotations, cluster status fields (Summary.Ready, etc.) never update.
+	if err == nil {
+		nsName := types.NamespacedName{Name: clusterNs}
+		err = retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+			ns := &corev1.Namespace{}
+			if getErr := k8sClient.Get(ctx, nsName, ns); getErr != nil {
+				return getErr
+			}
+			if ns.Annotations == nil {
+				ns.Annotations = map[string]string{}
+			}
+			ns.Annotations[v1alpha1.ClusterNamespaceAnnotation] = controllerNs
+			ns.Annotations[v1alpha1.ClusterAnnotation] = name
+			return k8sClient.Update(ctx, ns)
+		})
+	}
+
 	return cluster, err
 }
 
@@ -76,4 +99,14 @@ func ExtractResourceLogs(allLogs, resourceName string) string {
 		}
 	}
 	return strings.Join(resourceLogs, "\n")
+}
+
+// DisableReaper disables the testcontainers reaper (Ryuk) to avoid issues
+// with Docker container state in local development environments.
+// The reaper is mainly useful in CI but often causes race conditions locally.
+// This should be called in init() functions of test packages that use testcontainers.
+func DisableReaper() {
+	if os.Getenv("TESTCONTAINERS_RYUK_DISABLED") == "" {
+		os.Setenv("TESTCONTAINERS_RYUK_DISABLED", "true")
+	}
 }

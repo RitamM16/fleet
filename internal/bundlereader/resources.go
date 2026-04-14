@@ -8,9 +8,11 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strings"
 	"sync"
 
 	fleet "github.com/rancher/fleet/pkg/apis/fleet.cattle.io/v1alpha1"
+	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/semaphore"
 
@@ -19,7 +21,7 @@ import (
 	"sigs.k8s.io/yaml"
 )
 
-var hasOCIURL = regexp.MustCompile(`^oci:\/\/`)
+const ociURLPrefix = "oci://"
 
 // readResources reads and downloads all resources from the bundle. Resources
 // can be downloaded and are spread across multiple directories.
@@ -31,7 +33,10 @@ func readResources(ctx context.Context, spec *fleet.BundleSpec, compress bool, b
 
 	var chartDirs []*fleet.HelmOptions
 
-	if spec.Helm != nil && spec.Helm.Chart != "" {
+	if spec.Helm != nil && (spec.Helm.Chart != "" || spec.Helm.Repo != "") {
+		if strings.HasPrefix(spec.Helm.Chart, ociURLPrefix) {
+			logrus.Warnf("helm.chart contains an OCI URL %q; use helm.repo instead (helm.chart for OCI URLs is deprecated)", spec.Helm.Chart)
+		}
 		if err := parseValuesFiles(base, spec.Helm); err != nil {
 			return nil, err
 		}
@@ -40,11 +45,14 @@ func readResources(ctx context.Context, spec *fleet.BundleSpec, compress bool, b
 
 	for _, target := range spec.Targets {
 		if target.Helm != nil {
+			if strings.HasPrefix(target.Helm.Chart, ociURLPrefix) {
+				logrus.Warnf("helm.chart contains an OCI URL %q in target customization %q; use helm.repo instead (helm.chart for OCI URLs is deprecated)", target.Helm.Chart, target.Name)
+			}
 			err := parseValuesFiles(base, target.Helm)
 			if err != nil {
 				return nil, err
 			}
-			if target.Helm.Chart != "" {
+			if target.Helm.Chart != "" || target.Helm.Repo != "" {
 				chartDirs = append(chartDirs, target.Helm)
 			}
 		}
@@ -197,7 +205,7 @@ func generateValues(base string, chart *fleet.HelmOptions) (valuesMap *fleet.Gen
 }
 
 func mergeGenericMap(first, second *fleet.GenericMap) *fleet.GenericMap {
-	result := &fleet.GenericMap{Data: make(map[string]interface{})}
+	result := &fleet.GenericMap{Data: make(map[string]any)}
 	result.Data = data.MergeMaps(first.Data, second.Data)
 	return result
 }
@@ -217,7 +225,7 @@ func addRemoteCharts(ctx context.Context, directories []directory, base string, 
 				auth = Auth{}
 			}
 
-			chartURL, err := chartURL(ctx, *chart, auth, false)
+			chartURL, err := ChartURL(ctx, *chart, auth)
 			if err != nil {
 				return nil, fmt.Errorf("failed to resolve URL of %s: %w", downloadChartError(*chart), err)
 			}
@@ -258,7 +266,7 @@ func checksum(helm *fleet.HelmOptions) string {
 	if helm == nil {
 		return "none"
 	}
-	return fmt.Sprintf(".chart/%x", sha256.Sum256([]byte(helm.Chart + ":" + helm.Repo + ":" + helm.Version)[:]))
+	return fmt.Sprintf(".chart/%x", sha256.Sum256([]byte(helm.Chart+":"+helm.Repo+":"+helm.Version)))
 }
 
 // loadDirectories loads all resources from a bundle's directories

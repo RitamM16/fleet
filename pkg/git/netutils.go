@@ -9,9 +9,7 @@ import (
 
 	"github.com/go-git/go-git/v5/plumbing/transport"
 	httpgit "github.com/go-git/go-git/v5/plumbing/transport/http"
-	gossh "github.com/go-git/go-git/v5/plumbing/transport/ssh"
 	giturls "github.com/rancher/fleet/pkg/git-urls"
-	"golang.org/x/crypto/ssh"
 	corev1 "k8s.io/api/core/v1"
 
 	fleetgithub "github.com/rancher/fleet/internal/github"
@@ -51,27 +49,22 @@ func GetAuthFromSecret(url string, creds *corev1.Secret, knownHosts string) (tra
 		if err != nil {
 			return nil, err
 		}
-		auth, err := gossh.NewPublicKeys(gitURL.User.Username(), creds.Data[corev1.SSHAuthPrivateKey], "")
+		username := "git"
+		if gitURL.User != nil && gitURL.User.Username() != "" {
+			username = gitURL.User.Username()
+		}
+		// Prefer known_hosts from the secret; fall back to the cluster-wide value.
+		knownHostsData := creds.Data["known_hosts"]
+		if len(knownHostsData) == 0 {
+			knownHostsData = []byte(knownHosts)
+		}
+		auth, err := fleetssh.NewSSHPublicKeys(username, creds.Data[corev1.SSHAuthPrivateKey], knownHostsData)
 		if err != nil {
 			return nil, err
 		}
-		if creds.Data["known_hosts"] != nil {
-			auth.HostKeyCallback, err = fleetssh.CreateKnownHostsCallBack(creds.Data["known_hosts"])
-			if err != nil {
-				return nil, err
-			}
-		} else if len(knownHosts) > 0 {
-			auth.HostKeyCallback, err = fleetssh.CreateKnownHostsCallBack([]byte(knownHosts))
-			if err != nil {
-				return nil, err
-			}
-		} else {
-			//nolint:gosec // G106: Use of ssh InsecureIgnoreHostKey should be audited
-			auth.HostKeyCallback = ssh.InsecureIgnoreHostKey()
-		}
 		return auth, nil
 	default:
-		auth, err := fleetgithub.GetGithubAppAuthFromSecret(creds, GitHubAppGetter)
+		auth, err := fleetgithub.GetGithubAppAuthFromSecret(url, creds, GitHubAppGetter)
 		if err != nil {
 			if errors.Is(err, fleetgithub.ErrNotGithubAppSecret) {
 				return nil, nil
@@ -84,7 +77,7 @@ func GetAuthFromSecret(url string, creds *corev1.Secret, knownHosts string) (tra
 
 // GetHTTPClientFromSecret returns a HTTP client filled from the information in the given secret
 // and optional CABundle and insecureTLSVerify
-func GetHTTPClientFromSecret(creds *corev1.Secret, CABundle []byte, insecureTLSVerify bool, timeout time.Duration) (*http.Client, error) {
+func GetHTTPClientFromSecret(creds *corev1.Secret, bundleCA []byte, insecureTLSVerify bool, timeout time.Duration) (*http.Client, error) {
 	var (
 		username  string
 		password  string
@@ -105,8 +98,8 @@ func GetHTTPClientFromSecret(creds *corev1.Secret, CABundle []byte, insecureTLSV
 		}
 	}
 
-	if len(CABundle) > 0 {
-		cert, err := x509.ParseCertificate(CABundle)
+	if len(bundleCA) > 0 {
+		cert, err := x509.ParseCertificate(bundleCA)
 		if err != nil {
 			return nil, err
 		}

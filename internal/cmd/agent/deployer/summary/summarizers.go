@@ -2,6 +2,7 @@ package summary
 
 import (
 	"encoding/json"
+	"maps"
 	"os"
 	"strings"
 	"time"
@@ -188,9 +189,7 @@ func initializeCheckErrors() {
 			}
 
 			existingConditionsMap := GVKConditionErrorMapping[gvk]
-			for condition, errorMapping := range newConditionsMap {
-				existingConditionsMap[condition] = errorMapping
-			}
+			maps.Copy(existingConditionsMap, newConditionsMap)
 			GVKConditionErrorMapping[gvk] = existingConditionsMap
 		}
 		logrus.Debugf("GVK Error Mapping Set")
@@ -406,13 +405,14 @@ func checkActive(obj data.Object, _ []Condition, summary fleetv1.Summary) fleetv
 
 func checkPhase(obj data.Object, _ []Condition, summary fleetv1.Summary) fleetv1.Summary {
 	phase := obj.String("status", "phase")
-	if phase == "Succeeded" {
+	switch {
+	case phase == "Succeeded":
 		summary.State = "succeeded"
 		summary.Transitioning = false
-	} else if phase == "Bound" {
+	case phase == "Bound":
 		summary.State = "bound"
 		summary.Transitioning = false
-	} else if phase != "" && summary.State == "" {
+	case phase != "" && summary.State == "":
 		summary.State = phase
 	}
 	return summary
@@ -574,7 +574,7 @@ func kStatusSummarizer(obj data.Object, _ []Condition, summary fleetv1.Summary) 
 		// Deduplicate status messages (https://github.com/rancher/fleet/issues/2859)
 		messages := make(map[string]bool)
 		var resultMessages []string
-		for _, message := range strings.Split(result.Message, "; ") {
+		for message := range strings.SplitSeq(result.Message, "; ") {
 			if _, ok := messages[message]; ok {
 				continue
 			}

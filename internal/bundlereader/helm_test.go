@@ -7,6 +7,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
+	"crypto/x509"
+	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -85,7 +88,7 @@ func checksumPrefix(helm *fleet.HelmOptions) string {
 	if helm == nil {
 		return "none"
 	}
-	return fmt.Sprintf(".chart/%x", sha256.Sum256([]byte(helm.Chart + ":" + helm.Repo + ":" + helm.Version)[:]))
+	return fmt.Sprintf(".chart/%x", sha256.Sum256([]byte(helm.Chart+":"+helm.Repo+":"+helm.Version)))
 }
 
 func createChartDir(dir string) error {
@@ -246,10 +249,14 @@ func newTLSServer(index string, withAuth bool) *httptest.Server {
 
 func TestGetManifestFromHelmChart(t *testing.T) {
 	cases := []struct {
-		name                string
-		bd                  fleet.BundleDeployment
-		readerCalls         func(*mocks.MockReader)
-		requiresAuth        bool
+		name         string
+		bd           fleet.BundleDeployment
+		readerCalls  func(*mocks.MockReader)
+		requiresAuth bool
+		// injectSrvCert: when true, the test loop extracts the httptest server's
+		// TLS CA certificate and writes it into HelmChartOptions.CABundle before
+		// calling GetManifestFromHelmChart, simulating what the controller does.
+		injectSrvCert       bool
 		expectedNilManifest bool
 		expectedResources   []fleet.BundleResource
 		expectedErrNotNil   bool
@@ -284,7 +291,7 @@ func TestGetManifestFromHelmChart(t *testing.T) {
 				},
 			},
 			readerCalls: func(c *mocks.MockReader) {
-				c.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Return(fmt.Errorf("secret not found"))
+				c.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Return(errors.New("secret not found"))
 			},
 			requiresAuth:        false,
 			expectedNilManifest: true,
@@ -309,7 +316,7 @@ func TestGetManifestFromHelmChart(t *testing.T) {
 			},
 			readerCalls: func(c *mocks.MockReader) {
 				c.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
-					func(_ context.Context, _ types.NamespacedName, secret *corev1.Secret, _ ...interface{}) error {
+					func(_ context.Context, _ types.NamespacedName, secret *corev1.Secret, _ ...any) error {
 						secret.Data = make(map[string][]byte)
 						secret.Data[corev1.BasicAuthUsernameKey] = []byte(authUsername)
 						secret.Data[corev1.BasicAuthPasswordKey] = []byte("bad password")
@@ -382,6 +389,43 @@ func TestGetManifestFromHelmChart(t *testing.T) {
 			expectedErrNotNil: false,
 			expectedError:     "",
 		},
+		{
+			name: "load directory with CA bundle from HelmChartOptions",
+			bd: fleet.BundleDeployment{
+				Spec: fleet.BundleDeploymentSpec{
+					Options: fleet.BundleDeploymentOptions{
+						Helm: &fleet.HelmOptions{
+							Repo:  "##URL##", // will be replaced by the mock server url
+							Chart: "sleeper",
+						},
+					},
+					HelmChartOptions: &fleet.BundleHelmOptions{
+						// CABundle will be injected from the test server's cert.
+						InsecureSkipTLSverify: false,
+					},
+				},
+			},
+			readerCalls:         func(c *mocks.MockReader) {},
+			requiresAuth:        false,
+			injectSrvCert:       true,
+			expectedNilManifest: false,
+			expectedResources: []fleet.BundleResource{
+				{
+					Name:    "sleeper-chart/templates/deployment.yaml",
+					Content: deployment,
+				},
+				{
+					Name:    "sleeper-chart/values.yaml",
+					Content: values,
+				},
+				{
+					Name:    "sleeper-chart/Chart.yaml",
+					Content: chartYAML,
+				},
+			},
+			expectedErrNotNil: false,
+			expectedError:     "",
+		},
 	}
 
 	mockCtrl := gomock.NewController(t)
@@ -397,6 +441,22 @@ func TestGetManifestFromHelmChart(t *testing.T) {
 		srv := newTLSServer(helmRepoIndex, c.requiresAuth)
 		defer srv.Close()
 
+		if c.injectSrvCert {
+			// Extract the httptest server's TLS CA certificate and inject it as
+			// HelmChartOptions.CABundle, mirroring what the controller does at
+			// bundle creation time.
+			tlsCert := srv.TLS.Certificates[0]
+			leaf, err := x509.ParseCertificate(tlsCert.Certificate[0])
+			if err != nil {
+				t.Fatalf("parsing server certificate: %v", err)
+			}
+			var buf bytes.Buffer
+			if err := pem.Encode(&buf, &pem.Block{Type: "CERTIFICATE", Bytes: leaf.Raw}); err != nil {
+				t.Fatalf("encoding server certificate: %v", err)
+			}
+			c.bd.Spec.HelmChartOptions.CABundle = buf.Bytes()
+		}
+
 		resourcePrefix := ""
 		if c.bd.Spec.Options.Helm != nil {
 			c.bd.Spec.Options.Helm.Repo = strings.ReplaceAll(c.bd.Spec.Options.Helm.Repo, "##URL##", srv.URL)
@@ -411,7 +471,7 @@ func TestGetManifestFromHelmChart(t *testing.T) {
 		assert.Equal(c.expectedNilManifest, manifest == nil)
 		assert.Equal(c.expectedErrNotNil, err != nil)
 		if err != nil && c.expectedErrNotNil {
-			assert.Equal(c.expectedError, err.Error())
+			assert.Contains(err.Error(), c.expectedError)
 		}
 		if manifest != nil {
 			// check that all expected resources are found

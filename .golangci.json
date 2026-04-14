@@ -9,22 +9,28 @@
       "contextcheck",
       "copyloopvar",
       "dupl",
+      "dupword",
       "durationcheck",
       "errcheck",
       "errorlint",
       "funlen",
       "ginkgolinter",
+      "gocritic",
       "gocyclo",
       "gosec",
       "govet",
       "ineffassign",
+      "intrange",
       "loggercheck",
       "makezero",
       "misspell",
+      "mirror",
+      "modernize",
       "nakedret",
       "nilerr",
       "noctx",
       "nolintlint",
+      "perfsprint",
       "revive",
       "staticcheck",
       "testifylint",
@@ -32,7 +38,8 @@
       "unconvert",
       "unparam",
       "unused",
-      "usestdlibvars"
+      "usestdlibvars",
+      "usetesting"
     ],
     "exclusions": {
       "generated": "lax",
@@ -86,6 +93,16 @@
         {
           "linters": ["gosec"],
           "path": "benchmarks"
+        },
+        {
+          "linters": ["staticcheck"],
+          "text": "SA1019",
+          "path": "internal/cmd/agent/deployer/internal/diff/"
+        },
+        {
+          "linters": ["staticcheck"],
+          "text": "SA5011",
+          "path": "_test.go"
         }
       ]
     },

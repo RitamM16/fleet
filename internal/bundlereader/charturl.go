@@ -2,17 +2,27 @@ package bundlereader
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/Masterminds/semver/v3"
 	fleet "github.com/rancher/fleet/pkg/apis/fleet.cattle.io/v1alpha1"
+	fleetgit "github.com/rancher/fleet/pkg/git"
+	"github.com/sirupsen/logrus"
+	"golang.org/x/sync/singleflight"
 	repov1 "helm.sh/helm/v4/pkg/repo/v1"
 	"sigs.k8s.io/yaml"
 
@@ -22,39 +32,27 @@ import (
 	"oras.land/oras-go/v2/registry/remote/errcode"
 )
 
+const (
+	// safety timeout to prevent unbounded requests
+	httpClientTimeout = 5 * time.Minute
+)
+
+var (
+	concurrentIndexFetch singleflight.Group
+	transportsCache      = map[string]http.RoundTripper{}
+	transportsCacheMutex sync.RWMutex
+)
+
 // ChartVersion returns the version of the helm chart from a helm repo server, by
 // inspecting the repo's index.yaml
 func ChartVersion(ctx context.Context, location fleet.HelmOptions, a Auth) (string, error) {
-	if hasOCIURL.MatchString(location.Repo) {
-		repo := strings.TrimPrefix(location.Repo, "oci://")
-
-		r, err := remote.NewRepository(repo)
+	if repoURI, ok := strings.CutPrefix(location.Repo, ociURLPrefix); ok {
+		client, err := getOCIRepoClient(repoURI, a)
 		if err != nil {
-			return "", fmt.Errorf("failed to create OCI client: %w", err)
+			return "", err
 		}
 
-		authCli := &auth.Client{
-			Client: getHTTPClient(a),
-			Cache:  auth.NewCache(),
-		}
-		if a.Username != "" {
-			cred := auth.Credential{
-				Username: a.Username,
-				Password: a.Password,
-			}
-			authCli.Credential = func(ctx context.Context, s string) (auth.Credential, error) {
-				return cred, nil
-			}
-		}
-
-		r.Client = authCli
-
-		if a.BasicHTTP {
-			r.PlainHTTP = true
-		}
-
-		tag, err := GetOCITag(ctx, r, location.Version)
-
+		tag, err := GetOCITag(ctx, client, location.Version)
 		if len(tag) == 0 || err != nil {
 			return "", fmt.Errorf(
 				"could not find tag matching constraint %q in registry %s: %w",
@@ -63,19 +61,19 @@ func ChartVersion(ctx context.Context, location fleet.HelmOptions, a Auth) (stri
 				err,
 			)
 		}
-
 		return tag, nil
 	}
 
-	if location.Repo == "" {
+	repoURL := location.Repo
+	if repoURL == "" {
 		return location.Version, nil
 	}
 
-	if !strings.HasSuffix(location.Repo, "/") {
-		location.Repo = location.Repo + "/"
+	repoIndex, err := getHelmRepoIndex(ctx, repoURL, a)
+	if err != nil {
+		return "", err
 	}
-
-	chart, err := getHelmChartVersion(ctx, location, a)
+	chart, err := repoIndex.Get(location.Chart, location.Version)
 	if err != nil {
 		return "", err
 	}
@@ -87,56 +85,77 @@ func ChartVersion(ctx context.Context, location fleet.HelmOptions, a Auth) (stri
 	return chart.Version, nil
 }
 
-// chartURL returns the URL to the helm chart from a helm repo server, by
+func getOCIRepoClient(repoURI string, a Auth) (*remote.Repository, error) {
+	r, err := remote.NewRepository(repoURI)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create OCI client: %w", err)
+	}
+
+	authCli := &auth.Client{
+		Client: getHTTPClient(a),
+		Cache:  auth.NewCache(),
+	}
+	if a.Username != "" {
+		cred := auth.Credential{
+			Username: a.Username,
+			Password: a.Password,
+		}
+		authCli.Credential = func(ctx context.Context, s string) (auth.Credential, error) {
+			return cred, nil
+		}
+	}
+	r.Client = authCli
+
+	if a.BasicHTTP {
+		r.PlainHTTP = true
+	}
+
+	return r, nil
+}
+
+// ChartURL returns the URL to the helm chart from a helm repo server, by
 // inspecting the repo's index.yaml
-func chartURL(ctx context.Context, location fleet.HelmOptions, auth Auth, isHelmOps bool) (string, error) {
-	OCIField := location.Chart
-	if isHelmOps {
-		OCIField = location.Repo
+func ChartURL(ctx context.Context, location fleet.HelmOptions, auth Auth) (string, error) {
+	if uri, ok := isOCIChart(location); ok {
+		return uri, nil
 	}
-
-	if hasOCIURL.MatchString(OCIField) {
-		return OCIField, nil
-	}
-
-	if location.Repo == "" {
+	repoURL := location.Repo
+	if repoURL == "" {
 		return location.Chart, nil
 	}
 
-	if !strings.HasSuffix(location.Repo, "/") {
-		location.Repo = location.Repo + "/"
+	// Aggregate any concurrent helm repo index retrieval for the same combination of repo URL and auth
+	i, err, _ := concurrentIndexFetch.Do(auth.Hash()+repoURL, func() (any, error) {
+		return getHelmRepoIndex(ctx, repoURL, auth)
+	})
+	if err != nil {
+		return "", err
 	}
+	repoIndex := i.(helmRepoIndex)
 
-	chart, err := getHelmChartVersion(ctx, location, auth)
+	chart, err := repoIndex.Get(location.Chart, location.Version)
 	if err != nil {
 		return "", err
 	}
 
 	if len(chart.URLs) == 0 {
-		return "", fmt.Errorf("no URLs found for chart %s %s at %s", chart.Name, chart.Version, location.Repo)
+		return "", fmt.Errorf("no URLs found for chart %s %s at %s", chart.Name, chart.Version, repoURL)
 	}
-
-	chartURL, err := url.Parse(chart.URLs[0])
-	if err != nil {
-		return "", err
-	}
-
-	if chartURL.IsAbs() {
-		return chart.URLs[0], nil
-	}
-
-	repoURL, err := url.Parse(location.Repo)
-	if err != nil {
-		return "", err
-	}
-
-	return repoURL.ResolveReference(chartURL).String(), nil
+	return toAbsoluteURLIfNeeded(repoURL, chart.URLs[0])
 }
 
-// getHelmChartVersion returns the ChartVersion struct with the information to the given location
-// using the given authentication configuration
-func getHelmChartVersion(ctx context.Context, location fleet.HelmOptions, auth Auth) (*repov1.ChartVersion, error) {
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, location.Repo+"index.yaml", nil)
+type helmRepoIndex interface {
+	Get(chart, version string) (*repov1.ChartVersion, error)
+}
+
+// getHelmRepoIndex retrieves and parses the index.yaml from a base URL which can be used to find a specific chart and version
+func getHelmRepoIndex(ctx context.Context, repoURL string, auth Auth) (helmRepoIndex, error) {
+	indexURL, err := url.JoinPath(repoURL, "index.yaml")
+	if err != nil {
+		return nil, err
+	}
+
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, indexURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -149,7 +168,7 @@ func getHelmChartVersion(ctx context.Context, location fleet.HelmOptions, auth A
 
 	resp, err := client.Do(request)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to fetch %q: %w", indexURL, err)
 	}
 	defer resp.Body.Close()
 
@@ -159,22 +178,15 @@ func getHelmChartVersion(ctx context.Context, location fleet.HelmOptions, auth A
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("failed to read helm repo from %s, error code: %v", location.Repo+"index.yaml", resp.StatusCode)
+		return nil, fmt.Errorf("failed to read helm repo from %s, error code: %v", indexURL, resp.StatusCode)
 	}
 
-	repo := &repov1.IndexFile{}
-	if err := yaml.Unmarshal(bytes, repo); err != nil {
+	var index repov1.IndexFile
+	if err := yaml.Unmarshal(bytes, &index); err != nil {
 		return nil, err
 	}
-
-	repo.SortEntries()
-
-	chart, err := repo.Get(location.Chart, location.Version)
-	if err != nil {
-		return nil, err
-	}
-
-	return chart, nil
+	index.SortEntries()
+	return &index, nil
 }
 
 // GetOCITag fetches the highest available tag matching version v in repository r.
@@ -234,25 +246,116 @@ func GetOCITag(ctx context.Context, r *remote.Repository, v string) (string, err
 }
 
 func getHTTPClient(auth Auth) *http.Client {
-	client := &http.Client{}
+	return &http.Client{
+		Transport: transportForAuth(auth.InsecureSkipVerify, auth.CABundle),
+		Timeout:   httpClientTimeout,
+	}
+}
 
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.TLSClientConfig = &tls.Config{
-		InsecureSkipVerify: auth.InsecureSkipVerify, //nolint:gosec
+func transportHash(insecureSkipVerify bool, caBundle []byte) string {
+	hash := sha256.New()
+
+	// Write a length prefix for every field to avoid collisions
+	lenBuf := make([]byte, 8)
+	writeField := func(data []byte) {
+		binary.LittleEndian.PutUint64(lenBuf, uint64(len(data)))
+		hash.Write(lenBuf)
+		hash.Write(data)
 	}
 
-	if auth.CABundle != nil {
+	for _, v := range [][]byte{ // values to hash
+		caBundle,
+		{toByte(insecureSkipVerify)},
+	} {
+		writeField(v)
+	}
+
+	return hex.EncodeToString(hash.Sum(nil))
+}
+
+func transportForAuth(insecureSkipVerify bool, caBundle []byte) http.RoundTripper {
+	caBundle = append([]byte(nil), caBundle...) // defensive copy
+	if proxyCAPEM, ok := os.LookupEnv(fleetgit.ProxyCABundleEnvVar); ok && proxyCAPEM != "" {
+		proxyBytes := []byte(proxyCAPEM)
+		tmpPool := x509.NewCertPool()
+		if !tmpPool.AppendCertsFromPEM(proxyBytes) {
+			logrus.Warnf("%s is set but contains no valid PEM certificates; ignoring proxy CA bundle", fleetgit.ProxyCABundleEnvVar)
+		} else {
+			caBundle = append(caBundle, '\n')
+			caBundle = append(caBundle, proxyBytes...)
+		}
+	}
+
+	// We don't need the full hash
+	hash := transportHash(insecureSkipVerify, caBundle)
+
+	// Fast path: valid transport already exists
+	transportsCacheMutex.RLock()
+	rt, ok := transportsCache[hash]
+	transportsCacheMutex.RUnlock()
+	if ok {
+		return rt
+	}
+
+	transportsCacheMutex.Lock()
+	defer transportsCacheMutex.Unlock()
+
+	// Check again using write lock
+	if rt, ok := transportsCache[hash]; ok {
+		return rt
+	}
+
+	// Create new transport
+	baseTransport, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		// Another component has replaced the global default transport.
+		// Construct a transport that preserves the standard proxy and timeout
+		// defaults so runtime behaviour stays close to the stdlib baseline.
+		baseTransport = &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			DialContext: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		}
+	}
+	transport := baseTransport.Clone()
+	transport.TLSClientConfig = &tls.Config{
+		InsecureSkipVerify: insecureSkipVerify, //nolint:gosec
+	}
+	if caBundle != nil {
 		pool, err := x509.SystemCertPool()
 		if err != nil {
 			pool = x509.NewCertPool()
 		}
-		pool.AppendCertsFromPEM(auth.CABundle)
+		pool.AppendCertsFromPEM(caBundle)
 
 		transport.TLSClientConfig.RootCAs = pool
 		transport.TLSClientConfig.MinVersion = tls.VersionTLS12
 	}
 
-	client.Transport = transport
+	transportsCache[hash] = transport
+	return transport
+}
 
-	return client
+func isOCIChart(location fleet.HelmOptions) (string, bool) {
+	if strings.HasPrefix(location.Repo, ociURLPrefix) {
+		return location.Repo, true
+	}
+	return "", false
+}
+
+func toAbsoluteURLIfNeeded(baseURL, chartURL string) (string, error) {
+	// Check if already absolute
+	chartU, err := url.Parse(chartURL)
+	if err != nil || chartU.IsAbs() {
+		return chartURL, err
+	}
+
+	return url.JoinPath(baseURL, chartURL)
 }
